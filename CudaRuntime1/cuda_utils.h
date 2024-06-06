@@ -135,7 +135,8 @@ inline std::ostream& operator<<(std::ostream& os, const prettyTime& dt) {
 
 struct AutoCUDATimer {
     std::deque<CUDATimer> timers;
-    ~AutoCUDATimer() {
+
+    void finish() {
         float elapsed_since_last_stop;
         cudaEvent_t tlast = nullptr;
         for (auto& t : timers) {
@@ -147,10 +148,14 @@ struct AutoCUDATimer {
             auto dev_dur = t.Elapsed() * 1e-3; // in seconds
 
             std::cout << "\033[1;96m [AutoCUDATimer] @host " << prettyTime(host_dur)
-                      <<  " | @device (+" << prettyTime(elapsed_since_last_stop) << ") " << prettyTime(dev_dur) << " "
-                      << "\t (" << t.name << ":" << t.id << ") \033[0m" << std::endl;
+                << " | @device (+" << prettyTime(elapsed_since_last_stop) << ") " << prettyTime(dev_dur) << " "
+                << "\t (" << t.name << ":" << t.id << ") \033[0m" << std::endl;
             tlast = t.stop;
         }
+        timers.clear();
+    }
+    ~AutoCUDATimer() {
+        finish();
     }
     template<typename Callable>
     void timeit(Callable c, const char* name = nullptr, int id = 0) {
@@ -162,6 +167,10 @@ struct AutoCUDATimer {
 };
 
 static AutoCUDATimer gpu_timers;
+
+#define TIMEIT_BEGIN() gpu_timers.timers.emplace_back(__func__, __LINE__); gpu_timers.timers.back().Start();
+#define TIMEIT_END() gpu_timers.timers.back().Stop();
+#define TIMEIT_FINISH() gpu_timers.finish();
 
 #define TIMEIT(...) do { \
     gpu_timers.timers.emplace_back(__func__, __LINE__); \
