@@ -88,7 +88,13 @@ struct CUDATimer {
     cudaEvent_t stop;
     const char* name;
     int id;
-    CUDATimer(const char* name = "", int id = 0) : name(name), id(id) {
+    const char* annotation;
+    uint64_t bytes;
+    uint64_t flops;
+
+    CUDATimer(const char* name = "", int id = 0, const char * annotation="",
+              uint64_t bytes = 0, uint64_t flops = 0.0f)
+        : name(name), id(id), annotation(annotation), bytes(bytes), flops(flops) {
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
     }
@@ -148,8 +154,14 @@ struct AutoCUDATimer {
             auto dev_dur = t.Elapsed() * 1e-3; // in seconds
 
             std::cout << "\033[1;96m [AutoCUDATimer] @host " << prettyTime(host_dur)
-                << " | @device (+" << prettyTime(elapsed_since_last_stop) << ") " << prettyTime(dev_dur) << " "
-                << "\t (" << t.name << ":" << t.id << ") \033[0m" << std::endl;
+                << " | @device (+" << prettyTime(elapsed_since_last_stop) << ") " << prettyTime(dev_dur);
+            if (t.bytes)
+                std::cout << " " << std::fixed << std::setw(7) << std::setprecision(3)
+                          << t.bytes * 1e-9 / dev_dur << " GB/s";
+            if (t.flops)
+                std::cout << " " << std::fixed << std::setw(7) << std::setprecision(3)
+                          << t.flops * 1e-9 / dev_dur << " GFLOPS/s";
+            std::cout << "\t  " << t.annotation << " (" << t.name << ":" << t.id << ") \033[0m" << std::endl;
             tlast = t.stop;
         }
         timers.clear();
@@ -168,7 +180,7 @@ struct AutoCUDATimer {
 
 static AutoCUDATimer gpu_timers;
 
-#define TIMEIT_BEGIN() gpu_timers.timers.emplace_back(__func__, __LINE__); gpu_timers.timers.back().Start();
+#define TIMEIT_BEGIN(...) gpu_timers.timers.emplace_back(__func__, __LINE__, __VA_ARGS__); gpu_timers.timers.back().Start();
 #define TIMEIT_END() gpu_timers.timers.back().Stop();
 #define TIMEIT_FINISH() gpu_timers.finish();
 
@@ -179,3 +191,10 @@ static AutoCUDATimer gpu_timers;
     gpu_timers.timers.back().Stop(); \
 } while(0)
 
+#define CUDA_CALL(...) if ( __VA_ARGS__ != cudaSuccess) {\
+    auto err = cudaGetLastError(); \
+    std::stringstream ss; \
+    ss << __FILE__ << ":" << __LINE__ << "  Error  " << cudaGetErrorName(err) << " : " << cudaGetErrorString(err) << std::endl; \
+    std::cout << ss.str(); \
+    throw std::runtime_error(ss.str()); \
+}
