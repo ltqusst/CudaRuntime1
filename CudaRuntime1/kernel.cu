@@ -1,67 +1,6 @@
 ﻿
 #include "cuda_utils.h"
 #include <immintrin.h>
-/*
-* CUDA and Application to Task-Based Programming (part 1) | Eurographics'2021 Tutorial
-https://cuda-tutorial.github.io/
-part1 https://www.youtube.com/watch?v=6kT7vVHCZIc
-part2 https://www.youtube.com/watch?v=mrDWmnXC5Ck
-
-example of SMs/CUDA-Cores in GP104’s Architecture: 
-https://www.anandtech.com/show/10325/the-nvidia-geforce-gtx-1080-and-1070-founders-edition-review/4
-https://www.anandtech.com/show/11172/nvidia-unveils-geforce-gtx-1080-ti-next-week-699
-
- - CUDA core is just a scalar ALU;
-
- - GPU executes multiple threads in time-division multiplexing fasion, but unlike CPU:
-      - context-switching of HW threads is designed to be very fast (on 1 cycle level);
-      - HW-threads has all states in register files, never goto memory;
-      - HW-scheduler is designed to switching context (unlike OS running on CPU using SW-scheduler);
-      - number of threads supported are limited by register file size & HW-scheduler capability;
-      - HW-threads are grouped in unit of 32 into Warp, to get higher ALU throughput.
-      - number of wraps/HW-threads supported is far more than number of CUDA cores(to hide mem-latency).
- 
- for example on my GTX-1070, 2048 threads (or 64 warps) per SM are supported,
- but each SM has only 4 Warp schedulers, 16x oversubscride.
-
-
- GPU Memory hierarchy
- GPU cache is designed with significant different purpose from CPU's
- https://www.rastergrid.com/blog/gpu-tech/2021/01/understanding-gpu-caches/
-
-Cache Coherency:
-    As a result, GPU caches are usually incoherent, and require explicit flushing
-    and/or invalidation of the caches in order to recohere (i.e. to have a coherent
-    view of the data between the GPU cores and/or other devices).
-     - shader invocations within individual draw or compute dispatch commands
-       that run on different GPU cores may see incoherent views of the same memory data,
-       unless using coherent resources (see later), or issuing memory barriers within
-       the shader that flush/invalidate the per core caches
-     - subsequent draw or compute dispatch commands may see incoherent views of the
-       same memory data, unless appropriate memory barriers are issued through the API
-       that flush/invalidate the appropriate caches
-     - GPU commands and operations performed by other devices (e.g. CPU reads/writes)
-       may see incoherent views of the same memory data, unless appropriate synchronization
-       primitives (e.g. fences or semaphores) are used to synchronize them, which implicitly
-       insert the necessary memory barriers
-
-Per Core Instruction Cache:
-    One thing to keep in mind from performance point of view is that on GPUs
-    an instruction cache miss can potentially stall thousands of threads
-    instead of just one, as in the case of CPUs, so generally it’s highly recommended
-    for shader/kernel code to be small enough to completely fit into this cache.
-
-Per Core Data Cache:
-    "Thus reuse of cached data on GPUs usually does not happen in the time domain
-    as in case of CPUs (i.e. subsequent instructions of the same thread accessing
-    the same data multiple times), but rather in the spatial domain (i.e. instructions
-    of different threads on the same core accessing the same data).
-
-    Accordingly, using memory as temporary storage and relying on caching for fast
-    repeated access is not a good idea on GPUs, unlike on CPUs. However, the larger
-    register space and the availability of shared memory make up for that in practice."
-
-*/
 
 __global__ void TensorAddKernel(int* c, int* a, int* b, int d0, int d1)
 {
@@ -196,6 +135,99 @@ __global__ void reduceParallelSharedShfl(const float* input, int N) {
         atomicAdd(&result, x);
 }
 
+__global__ void reduceParallelSharedShfl2(const float* input, int N) {
+    __shared__ float data[BLOCKSIZE];
+    int id = threadIdx.x + blockIdx.x * blockDim.x;
+    data[threadIdx.x] = (id < N ? input[id] : 0);
+    
+    int thread_offset = 32 * (threadIdx.x / 32);
+    int lane_id = threadIdx.x % 32;
+
+    // horizontal reduce
+    float x = data[threadIdx.x];
+
+    // SIMD horizontal reduce
+    x += __shfl_sync(0xFFFFFFFF, x, threadIdx.x + 16);
+    x += __shfl_sync(0xFFFFFFFF, x, threadIdx.x + 8);
+    x += __shfl_sync(0xFFFFFFFF, x, threadIdx.x + 4);
+    x += __shfl_sync(0xFFFFFFFF, x, threadIdx.x + 2);
+    x += __shfl_sync(0xFFFFFFFF, x, 1);
+
+    if (lane_id == 0)
+        atomicAdd(&result, x);
+}
+
+
+__global__ void reduceParallelMemBoundx8(const float* input, int subN) {
+    __shared__ float data[BLOCKSIZE][8];
+    int id = threadIdx.x + blockIdx.x * blockDim.x;
+    if (id < subN) {
+        int threadOffset = (32 * (id / 32)) * 8;
+        int id0 = threadOffset + (threadIdx.x % 32);
+        int id1 = id0;
+        for (int i = 0; i < 8; i++) {
+            data[threadIdx.x][i] = input[id1];
+            id1 += 32;
+        }
+        __syncthreads();
+        float x = 0;
+        for (int i = 0; i < 8; i++) {
+            x += data[threadIdx.x][i];
+        }
+        //data[threadIdx.x] = x;
+        if (x > 16000) {
+            // cannot happen, just to prevent optimization
+            atomicAdd(&result, x);
+        }
+    }
+}
+/*
+According to:
+https://www.anandtech.com/show/10325/the-nvidia-geforce-gtx-1080-and-1070-founders-edition-review/4
+
+1070 has 8GB VRAM with 256GB/s bandwidth, 16 SMs with 1.645GHz, assume each SM can load 8*4 u32 data, 
+and following kernel loaded 4bytes into R2 within 18 instructions (9cycles if 2-dispatch units works well)
+
+1.645*16*32/9 = 93.58 GB/s, actuall observed bandwidth is higher (140GB/s), but still not reach 256GB/s.
+major problem is CUDA cores are busy executing non-memory load instructions, so it didn't issue enough LDG instructions.
+for example, CUDA core need to issue one f32/int32 read on every (1.645*16*4*8*4)/256 ~= 13 cycles to get 256GB/s.
+
+_Z22reduceParallelMemBoundPKfi:
+		MOV R1, c[0x0][0x20] ;
+		S2R R0, SR_TID.X ;
+		S2R R2, SR_CTAID.X ;
+		XMAD R0, R2.reuse, c[0x0] [0x8], R0 ;
+		XMAD.MRG R3, R2.reuse, c[0x0] [0x8].H1, RZ ;
+		XMAD.PSL.CBCC R2, R2.H1, R3.H1, R0 ;
+		ISETP.GE.AND P0, PT, R2, c[0x0][0x148], PT ;
+		NOP ;
+		@P0 EXIT ; <================================================ if (id < N)
+		SHR R0, R2.reuse, 0x1e ;
+		ISCADD R2.CC, R2, c[0x0][0x140], 0x2 ;
+		IADD.X R3, R0, c[0x0][0x144] ;
+		LDG.E R0, [R2] ; <========================================== Load 
+		FSETP.GT.AND P0, PT, R0, 160, PT ;
+		NOP ;
+		NOP ;
+		NOP ;
+		@!P0 EXIT ; <=============================================== if (x > 160) all threads exit here
+		MOV R2, c[0x4][0x0] ;
+		MOV R3, c[0x4][0x4] ;
+		RED.E.ADD.F32.FTZ.RN [R2], R0 ;
+		NOP ;
+		NOP ;
+		NOP ;
+		EXIT ;
+.L_x_0:
+		BRA `(.L_x_0) ;
+		NOP;
+		NOP;
+		NOP;
+		NOP;
+.L_x_1:
+*/
+
+
 template<typename T>
 T tensor_reduce(tensor2D<T>& c) {
     if (c.on_device) {
@@ -225,6 +257,15 @@ T tensor_reduce(tensor2D<T>& c) {
         reduceParallelSharedShfl << <gridSize, blockSize >> > (c.ptr_dev, c.size); // 64us
         TIMEIT_END();
 
+        CUDA_CALL(cudaMemcpyToSymbol(result, &Y, sizeof(Y)));
+        TIMEIT_BEGIN("reduceParallelSharedShfl2", bytes, flops);
+        reduceParallelSharedShfl2 << <gridSize, blockSize >> > (c.ptr_dev, c.size); // 64us
+        TIMEIT_END();
+
+        dim3 gridSize2(c.size / 1024/8);
+        TIMEIT_BEGIN("reduceParallelMemBoundx8", bytes, flops);
+        reduceParallelMemBoundx8 << <gridSize2, blockSize >> > (c.ptr_dev, c.size/8);
+        TIMEIT_END();
         CUDA_CALL(cudaMemcpyFromSymbol(&Y, result, sizeof(result)));
         return Y;
     }
@@ -242,7 +283,7 @@ T tensor_reduce(tensor2D<T>& c) {
 
 
 void testReduce() {
-    tensor2D<float> c(1024, 1024);
+    tensor2D<float> c(1024*16, 1024);
     for (int i = 0; i < c.size; i++)
         c.ptr_host[i] = (i % 16) - 8;
     auto s0 = tensor_reduce(c);
